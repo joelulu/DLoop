@@ -37,6 +37,22 @@ class ReportingTests(unittest.TestCase):
         self.assertAlmostEqual(adaptive["gain_vs_original_pct"], 100 * (13 / 11 - 1))
         self.assertEqual(adaptive["ar_match"], 48)
 
+    def test_mismatches_suppress_lossless_speedup(self):
+        rows = [dict(config=name, phase="confirm", tok_s=speed,
+                     verifies_per_100_tokens=5, mean_accepted_draft=6,
+                     mean_committed=7, ar_match=matches, samples=16)
+                for name, speed, matches in (("target_ar", 5, 16), ("original_g-1", 10, 16),
+                                             ("adaptive_loop_prefix_logp_-1", 12, 15))]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td)
+            (path / "summaries.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+            result = summarize_directory(path)
+        for row in result:
+            self.assertFalse(row["comparison_valid"])
+            self.assertIsNone(row["speedup_vs_ar"])
+            self.assertIsNone(row["gain_vs_original_pct"])
+        self.assertAlmostEqual(result[-1]["exploratory_gain_vs_original_pct"], 20)
+
 
 if __name__ == "__main__":
     unittest.main()

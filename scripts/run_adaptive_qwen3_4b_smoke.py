@@ -25,6 +25,10 @@ def parse_args():
     p.add_argument("--model", default="Qwen/Qwen3-4B")
     p.add_argument("--draft-model", default="naver-ai/DLoop-DFlash-Qwen3-4B")
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--target-attention", choices=["sdpa", "eager"], default="sdpa")
+    p.add_argument("--model-dtype", choices=["bfloat16", "float32"], default="bfloat16")
+    p.add_argument("--ar-check", choices=["strict", "warn"], default="strict",
+                   help="strict diagnoses then aborts; warn is exploratory and marks results non-equivalent")
     p.add_argument("--dataset", default="gsm8k", choices=["gsm8k", "math500", "mbpp"])
     p.add_argument("--data-file", type=Path, help="optional local JSONL: {turns: [prompt]} or {prompt: ...}")
     p.add_argument("--output-dir", type=Path)
@@ -78,6 +82,9 @@ def main():
     torch.cuda.set_device(device)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+    if args.model_dtype == "float32":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     outdir = args.output_dir or ROOT / "results" / ("adaptive_qwen3_4b_" + time.strftime("%Y%m%d_%H%M%S"))
     outdir.mkdir(parents=True, exist_ok=False)  # never silently overwrite a run
     if args.data_file:
@@ -98,7 +105,8 @@ def main():
                     timing="decode excludes target prefill/first token; includes draft context prefill",
                     git_sha=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip())
     (outdir / "manifest.json").write_text(json.dumps(manifest, default=str, indent=2))
-    target, draft = _load_models(SimpleNamespace(model=args.model, draft_model=args.draft_model), "dflash", device)
+    target, draft = _load_models(SimpleNamespace(model=args.model, draft_model=args.draft_model,
+                                                        target_attention=args.target_attention, model_dtype=args.model_dtype), "dflash", device)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     stop_ids = [tokenizer.eos_token_id]
     prompts = {}
@@ -133,6 +141,7 @@ def main():
         generate(smoke[0], policy, min(64, args.max_new_tokens))
 
     reference = {}
+    diagnostic_done = set()
     def run(name, policy, ids, phase, repeat=0, trace=False):
         rows = []
         for idx in ids:
@@ -153,7 +162,21 @@ def main():
             with (outdir / ("traces.jsonl" if trace else "responses.jsonl")).open("a") as f:
                 f.write(json.dumps(row) + "\n")
             if not matches:
-                raise RuntimeError(f"AR mismatch: {phase}/{name}/sample {idx}; saved {outdir}")
+                from eval.ar_diagnostics import diagnose_mismatch, mismatch_summary
+                detail = mismatch_summary(reference[idx], ids_out, tokenizer)
+                print(f"AR mismatch: {phase}/{name}/sample {idx}: {detail}", flush=True)
+                if name not in diagnostic_done:
+                    diagnostic_done.add(name)
+                    diagnostic_path = outdir / f"mismatch_{phase}_{name}_{idx}.json"
+                    try:
+                        detail = diagnose_mismatch(target, draft, prompts[idx], reference[idx], ids_out,
+                                                   policy, args.max_new_tokens, stop_ids, tokenizer)
+                    except Exception as exc:
+                        detail["diagnostic_error"] = repr(exc)
+                    diagnostic_path.write_text(json.dumps(detail, indent=2, ensure_ascii=False))
+                    print(f"Untimed mismatch diagnostic saved: {diagnostic_path}", flush=True)
+                if args.ar_check == "strict":
+                    raise RuntimeError(f"AR mismatch: {phase}/{name}/sample {idx}; see mismatch_*.json in {outdir}")
             rows.append(row)
         summary = dict(phase=phase, config=name, repeat=repeat, **summarize(rows))
         with (outdir / ("trace_summaries.jsonl" if trace else "summaries.jsonl")).open("a") as f:

@@ -212,7 +212,12 @@ def adaptive_dflash_generate(model, target, input_ids, max_new_tokens, stop_toke
         pass_counts.append(passes)
         retained_lengths.extend(retained_this_round)
         if trace:
+            top = out.logits[0].float().topk(min(2, out.logits.shape[-1]), dim=-1)
             round_traces.append(dict(anchor_position=start, retained=retained_this_round,
+                                     output_start=start - prompt_len + 1,
+                                     candidate_ids=candidates[0].tolist(),
+                                     posterior_top_ids=top.indices.tolist(),
+                                     posterior_top_logits=top.values.tolist(),
                                      accepted=effective_acc, committed=additions.shape[1],
                                      verify_width=candidates.shape[1], stop_reason=stop_reason,
                                      second_segment_accepted=max(0, effective_acc - (

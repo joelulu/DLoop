@@ -150,3 +150,42 @@ New modes use a separate baseline-cache namespace so upstream timing conventions
 are not silently mixed. The standalone screening script above is the preferred
 path for threshold selection and matched, repeated comparisons. Random sampling,
 tree verification, DSpark, Domino and batched serving are outside this prototype.
+
+## Diagnosing an AR mismatch
+
+Strict AR comparison remains the default. On a mismatch the runner now prints
+the first differing token/context and writes an untimed `mismatch_*.json` report
+before stopping. A greedy block-verification output can differ from incremental
+BF16 AR because the numerical execution shapes differ, but that possibility
+must not be used to assume away a cache or indexing bug.
+
+Replay an existing failed run (the original responses and manifest suffice):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/diagnose_ar_mismatch.py results/your_run_directory
+```
+
+It compares the first shared-prefix divergence, records verifier top-2 logits,
+replays the common prefix with token-by-token AR and full-prefix evaluation,
+and checks the upstream decoder when the failing mode is `single`. The report
+also states whether the saved failure reproduces. No diagnostic timings are
+included in the performance comparison.
+
+Optional numerical sensitivity checks, each using the same saved sample:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/diagnose_ar_mismatch.py results/your_run_directory \
+  --target-attention eager
+CUDA_VISIBLE_DEVICES=0 python scripts/diagnose_ar_mismatch.py results/your_run_directory \
+  --target-attention eager --model-dtype float32
+```
+
+FP32 applies to both target and draft and disables TF32; it needs more memory.
+These are diagnostic runs, not equivalent-backend speed comparisons.
+`--saved-only` prints stored token IDs/lengths without loading any models.
+The main runner also accepts `--target-attention` and `--model-dtype`.
+
+For explicitly exploratory measurements, `--ar-check warn` continues after
+mismatches while preserving AR-match counts and diagnostic reports. If held-out
+outputs differ, `comparison_valid=false` and the lossless speedup columns are
+suppressed; only separately labeled exploratory throughput ratios are reported.

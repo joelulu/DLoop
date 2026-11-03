@@ -37,12 +37,16 @@ class Target(torch.nn.Module):
         logits = torch.zeros((*hidden.shape[:2], VOCAB))
         return logits.scatter_(-1, hidden[..., :1].long(), hidden[..., 1:2])
 
-    def forward(self, ids, position_ids, past_key_values, use_cache,
+    def forward(self, ids, position_ids=None, past_key_values=None, use_cache=True,
                 logits_to_keep=None, output_hidden_states=False):
         n = ids.shape[1]
-        assert past_key_values.get_seq_length() == int(position_ids[0, 0])
+        cached = past_key_values.get_seq_length() if past_key_values is not None else 0
+        if position_ids is None:
+            position_ids = torch.arange(cached, cached + n)[None]
+        assert cached == int(position_ids[0, 0])
         kv = torch.zeros(1, 1, n, 1)
-        past_key_values.update(kv, kv, 0)
+        if past_key_values is not None:
+            past_key_values.update(kv, kv, 0)
         hidden = torch.stack([((ids + 1) % VOCAB).float(), torch.full_like(ids, 12).float(),
                               position_ids.float()], -1)
         logits = self.lm_head(hidden)

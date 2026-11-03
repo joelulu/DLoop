@@ -15,6 +15,7 @@ def summarize_directory(directory):
         if row["phase"] == "confirm":
             groups[row["config"]].append(row)
     result = []
+    comparison_valid = all(r["ar_match"] == r["samples"] for rows in groups.values() for r in rows)
     baseline = next((statistics.median(r["tok_s"] for r in rows)
                      for name, rows in groups.items() if name.startswith("original_")), None)
     ar = statistics.median(r["tok_s"] for r in groups.get("target_ar", [])) if groups.get("target_ar") else None
@@ -25,8 +26,10 @@ def summarize_directory(directory):
             return statistics.mean(values) if values else None
         result.append(dict(config=name, repeats=len(rows), median_tok_s=speed,
                            min_tok_s=min(r["tok_s"] for r in rows), max_tok_s=max(r["tok_s"] for r in rows),
-                           speedup_vs_ar=speed / ar if ar else None,
-                           gain_vs_original_pct=100 * (speed / baseline - 1) if baseline else None,
+                           comparison_valid=comparison_valid,
+                           speedup_vs_ar=speed / ar if ar and comparison_valid else None,
+                           gain_vs_original_pct=100 * (speed / baseline - 1) if baseline and comparison_valid else None,
+                           exploratory_gain_vs_original_pct=100 * (speed / baseline - 1) if baseline else None,
                            verifies_per_100_tokens=mean("verifies_per_100_tokens"),
                            mean_accepted_draft=mean("mean_accepted_draft"), mean_committed=mean("mean_committed"),
                            ar_match=sum(r["ar_match"] for r in rows), samples=sum(r["samples"] for r in rows)))
@@ -48,6 +51,9 @@ def main():
         gain = row["gain_vs_original_pct"]
         gain_text = f"{gain:+.2f}%" if gain is not None else "n/a"
         print(f"{row['config']:45s} {row['median_tok_s']:8.2f} tok/s  vs DLoop {gain_text}")
+    if not all(row["comparison_valid"] for row in result):
+        print("WARNING: AR mismatches observed. comparison_valid=false; lossless speedup columns suppressed. "
+              "Exploratory throughput is not a matched-output speedup claim.")
 
 
 if __name__ == "__main__":

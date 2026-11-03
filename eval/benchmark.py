@@ -250,7 +250,8 @@ def _load_models(args, host: str, device):
         target = load_mtp_target(args.model, device)
     else:
         target = AutoModelForCausalLM.from_pretrained(
-            args.model, attn_implementation="sdpa", dtype=torch.bfloat16,
+            args.model, attn_implementation=getattr(args, "target_attention", "sdpa"),
+            dtype=getattr(torch, getattr(args, "model_dtype", "bfloat16")),
         ).to(device).eval()
     if host is None:
         return target, None
@@ -258,7 +259,8 @@ def _load_models(args, host: str, device):
         from specforge.modeling.draft.dflash import DFlashDraftModel
 
         draft = DFlashDraftModel.from_pretrained(
-            args.draft_model, attn_implementation="sdpa", dtype=torch.bfloat16,
+            args.draft_model, attn_implementation="sdpa",
+            dtype=getattr(torch, getattr(args, "model_dtype", "bfloat16")),
         ).to(device).eval()
     elif host in ("dspark", "domino"):
         from .head_decode import load_drafter
