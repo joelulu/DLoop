@@ -22,9 +22,13 @@ def summarize_directory(directory):
     for name, rows in groups.items():
         speed = statistics.median(r["tok_s"] for r in rows)
         def mean(key):
-            values = [r[key] for r in rows if r[key] is not None]
+            values = [r[key] for r in rows if r.get(key) is not None]
             return statistics.mean(values) if values else None
-        result.append(dict(config=name, repeats=len(rows), median_tok_s=speed,
+        result.append(dict(config=name, cut_offset=rows[0].get("cut_offset"),
+                           min_confident_ratio=rows[0].get("min_confident_ratio"),
+                           second_pass_rate=mean("second_pass_rate"), gate_pass_rate=mean("gate_pass_rate"),
+                           mean_applied_cut=mean("mean_applied_cut"), shift_clipped=mean("shift_clipped"),
+                           repeats=len(rows), median_tok_s=speed,
                            min_tok_s=min(r["tok_s"] for r in rows), max_tok_s=max(r["tok_s"] for r in rows),
                            comparison_valid=comparison_valid,
                            speedup_vs_ar=speed / ar if ar and comparison_valid else None,

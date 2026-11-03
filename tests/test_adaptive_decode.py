@@ -240,6 +240,16 @@ class TinyQwenTests(unittest.TestCase):
                                               PrefixPolicy(max_candidates=10), trace=True)
         self.assertTrue(torch.equal(ref, result.output_ids))
         self.assertEqual(result.round_traces[0]["retained"], [3, 3])
+        for offset in (-1, 1):
+            with self.subTest(gated_offset=offset), patch(
+                "eval.adaptive_linear_decode.select_prefix", side_effect=lambda lp, *_: min(3, lp.numel())
+            ):
+                gated = adaptive_dflash_generate(
+                    draft, target, prompt, 12, [],
+                    PrefixPolicy(mode="gated_prefix_loop", min_confident_ratio=.4,
+                                 cut_offset=offset, max_candidates=10), trace=True)
+            self.assertTrue(torch.equal(ref, gated.output_ids))
+            self.assertEqual(gated.round_traces[0]["retained"], [3 + offset, min(7, 7 - offset)])
 
 
 if __name__ == "__main__":

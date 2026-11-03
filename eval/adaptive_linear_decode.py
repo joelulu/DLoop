@@ -24,9 +24,11 @@ class PrefixPolicy:
     min_continue_tokens: int = 1
     max_candidates: int = 30
     total_logp_budget: float | None = None
+    min_confident_ratio: float = 0.8
+    cut_offset: int = 0
 
     def __post_init__(self):
-        if self.mode not in {"single", "original_loop", "truncate_verify", "adaptive_loop"}:
+        if self.mode not in {"single", "original_loop", "truncate_verify", "adaptive_loop", "gated_prefix_loop"}:
             raise ValueError("unknown decode mode")
         if self.rule not in {"prefix_logp", "token_prob"}:
             raise ValueError("unknown prefix rule")
@@ -38,6 +40,12 @@ class PrefixPolicy:
             raise ValueError("token probability must be in (0, 1]")
         if min(self.max_draft_passes, self.min_continue_tokens, self.max_candidates) < 1:
             raise ValueError("pass, progress and candidate limits must be positive")
+        if not math.isfinite(self.min_confident_ratio) or not 0 < self.min_confident_ratio <= 1:
+            raise ValueError("min_confident_ratio must be in (0, 1]")
+        if not isinstance(self.cut_offset, int):
+            raise ValueError("cut_offset must be an integer")
+        if self.mode == "gated_prefix_loop" and self.total_logp_budget is not None:
+            raise ValueError("gated_prefix_loop does not use the legacy total_logp_budget")
         if self.total_logp_budget is not None and (
             not math.isfinite(self.total_logp_budget) or self.total_logp_budget > 0
         ):
@@ -53,6 +61,29 @@ def select_prefix(token_logp, rule, threshold):
     else:
         raise ValueError(rule)
     return int(allowed.to(torch.int64).cumprod(-1).sum().item())
+
+
+def gated_prefix_decision(token_logp, policy, room, pass_index):
+    """Gate on the UNshifted prefix; offset only the boundary for another pass.
+
+    The final pass and failed gates preserve the full proposal. The ratio always
+    refers to the checkpoint's full candidate width, never a tail-clipped width.
+    Returns (retained length, continue, raw confident length, reason).
+    """
+    width = token_logp.numel()
+    full = min(width, room)
+    if pass_index + 1 >= policy.max_draft_passes:
+        return full, False, None, "final_full_block"
+    if room <= width:
+        return full, False, None, "tail_full_block"
+    raw = select_prefix(token_logp, policy.rule, policy.threshold)
+    minimum = math.ceil(policy.min_confident_ratio * width)
+    if raw < minimum:
+        return full, False, raw, "ratio_gate_failed_full_verify"
+    cut = min(width, max(1, raw + policy.cut_offset))
+    if cut < policy.min_continue_tokens:
+        return full, False, raw, "progress_gate_failed_full_verify"
+    return cut, True, raw, "continue_from_shifted_prefix"
 
 
 def _clock(device):
@@ -110,6 +141,8 @@ def adaptive_dflash_generate(model, target, input_ids, max_new_tokens, stop_toke
     accepted_lengths, committed_lengths, verify_lengths, pass_counts = [], [], [], []
     retained_lengths, round_traces = [], []
     draft_calls = 0
+    prefix_counts = dict(gate_checks=0, gate_passes=0, shift_clipped=0,
+                         raw_confident_sum=0, applied_cut_sum=0)
     initial_eos = int(generated[0, 0]) in stop_ids
 
     while generated.shape[1] < max_new_tokens and not initial_eos:
@@ -119,6 +152,7 @@ def adaptive_dflash_generate(model, target, input_ids, max_new_tokens, stop_toke
         candidates = generated[:, -1:]  # anchor + unverified proposals
         carriers = None
         retained_this_round = []
+        decision_trace = []
         cumulative_logp = 0.0
         passes = 0
         stop_reason = "target_only"
@@ -151,7 +185,19 @@ def adaptive_dflash_generate(model, target, input_ids, max_new_tokens, stop_toke
                 passes += 1
                 draft_calls += 1
                 room = cap - L
-                if policy.mode in {"single", "original_loop"}:
+                allow_continue = None
+                raw_confident = None
+                if policy.mode == "gated_prefix_loop":
+                    keep, allow_continue, raw_confident, stop_reason = gated_prefix_decision(
+                        logp, policy, room, pass_idx)
+                    if raw_confident is not None:
+                        prefix_counts["gate_checks"] += 1
+                        prefix_counts["raw_confident_sum"] += raw_confident
+                        if allow_continue:
+                            prefix_counts["gate_passes"] += 1
+                            prefix_counts["applied_cut_sum"] += keep
+                            prefix_counts["shift_clipped"] += int(keep != raw_confident + policy.cut_offset)
+                elif policy.mode in {"single", "original_loop"}:
                     keep = min(block - 1, room)
                 else:
                     keep = select_prefix(logp[:room], policy.rule, policy.threshold)
@@ -167,10 +213,16 @@ def adaptive_dflash_generate(model, target, input_ids, max_new_tokens, stop_toke
                 carriers = hidden[:, :keep] if carriers is None else torch.cat(
                     [carriers, hidden[:, :keep]], 1)
                 retained_this_round.append(keep)
+                if trace:
+                    decision_trace.append(dict(raw_confident=raw_confident, retained=keep,
+                                               cut_offset=policy.cut_offset,
+                                               allow_continue=allow_continue, reason=stop_reason))
                 if trace or policy.total_logp_budget is not None:
                     cumulative_logp += float(logp[:keep].sum())
                 if zero_fallback:
                     stop_reason = "zero_prefix_fallback"
+                    break
+                if policy.mode == "gated_prefix_loop" and not allow_continue:
                     break
                 if policy.mode in {"single", "truncate_verify"}:
                     stop_reason = "single_pass"
@@ -214,6 +266,7 @@ def adaptive_dflash_generate(model, target, input_ids, max_new_tokens, stop_toke
         if trace:
             top = out.logits[0].float().topk(min(2, out.logits.shape[-1]), dim=-1)
             round_traces.append(dict(anchor_position=start, retained=retained_this_round,
+                                     prefix_decisions=decision_trace,
                                      output_start=start - prompt_len + 1,
                                      candidate_ids=candidates[0].tolist(),
                                      posterior_top_ids=top.indices.tolist(),
@@ -236,4 +289,5 @@ def adaptive_dflash_generate(model, target, input_ids, max_new_tokens, stop_toke
         verify_lengths=verify_lengths, draft_pass_counts=pass_counts,
         retained_lengths=retained_lengths, verify_calls=len(verify_lengths),
         draft_calls=draft_calls, stages_fired=[], round_traces=round_traces,
+        prefix_decision_counts=prefix_counts,
     )

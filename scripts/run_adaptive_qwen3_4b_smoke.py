@@ -25,10 +25,16 @@ def parse_args():
     p.add_argument("--model", default="Qwen/Qwen3-4B")
     p.add_argument("--draft-model", default="naver-ai/DLoop-DFlash-Qwen3-4B")
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--experiment", choices=["legacy", "prefix_offsets"], default="legacy")
+    p.add_argument("--cut-offsets", type=int, nargs="+", default=[-3, -2, -1, 0, 1, 2, 4])
+    p.add_argument("--min-confident-ratio", type=float, default=0.8)
+    p.add_argument("--prefix-threshold", type=float, default=-2.0)
     p.add_argument("--target-attention", choices=["sdpa", "eager"], default="sdpa")
     p.add_argument("--model-dtype", choices=["bfloat16", "float32"], default="bfloat16")
     p.add_argument("--ar-check", choices=["strict", "warn"], default="strict",
                    help="strict diagnoses then aborts; warn is exploratory and marks results non-equivalent")
+    p.add_argument("--mismatch-diagnostics", choices=["each", "first", "off"], default="each",
+                   help="untimed AR mismatch replay frequency; off still records AR-match counts")
     p.add_argument("--dataset", default="gsm8k", choices=["gsm8k", "math500", "mbpp"])
     p.add_argument("--data-file", type=Path, help="optional local JSONL: {turns: [prompt]} or {prompt: ...}")
     p.add_argument("--output-dir", type=Path)
@@ -49,7 +55,44 @@ def parse_args():
             p.error(f"--{name.replace('_', '-')} must be positive")
     if args.max_new_tokens < 2:
         p.error("--max-new-tokens must be >= 2 to measure decode throughput")
+    if args.experiment == "prefix_offsets" and args.total_logp_budget is not None:
+        p.error("prefix_offsets does not use --total-logp-budget")
     return args
+
+
+def experiment_configs(args):
+    from eval.adaptive_linear_decode import PrefixPolicy
+    common = dict(max_draft_passes=args.max_draft_passes, min_continue_tokens=args.min_continue_tokens,
+                  max_candidates=args.max_candidates, total_logp_budget=args.total_logp_budget)
+    configs = {"single": PrefixPolicy(mode="single", **common)}
+    for gate in (-0.5, -1.0, -2.0):
+        configs[f"original_g{gate}"] = PrefixPolicy(mode="original_loop", loop_gate=gate, **common)
+    if args.experiment == "prefix_offsets":
+        for offset in dict.fromkeys(args.cut_offsets):
+            name = f"gated_r{args.min_confident_ratio}_g{args.prefix_threshold}_offset{offset:+d}"
+            configs[name] = PrefixPolicy(mode="gated_prefix_loop", threshold=args.prefix_threshold,
+                                         min_confident_ratio=args.min_confident_ratio,
+                                         cut_offset=offset, **common)
+    else:
+        for rule, thresholds in (("prefix_logp", (-0.5, -1.0, -2.0)), ("token_prob", (0.8, 0.9, 0.95))):
+            for threshold in thresholds:
+                for mode in ("truncate_verify", "adaptive_loop"):
+                    configs[f"{mode}_{rule}_{threshold}"] = PrefixPolicy(
+                        mode=mode, rule=rule, threshold=threshold, **common)
+    return configs
+
+
+def select_confirmation_configs(configs, scores, experiment):
+    selected = {"single": "single"}
+    modes = ("original_loop",) if experiment == "prefix_offsets" else (
+        "original_loop", "truncate_verify", "adaptive_loop")
+    for mode in modes:
+        candidates = [n for n, p in configs.items() if p.mode == mode]
+        selected[mode] = max(candidates, key=lambda n: scores[n]["tok_s"])
+    if experiment == "prefix_offsets":
+        # Report EVERY offset on the same held-out samples, not only a winner.
+        selected.update({name: name for name, p in configs.items() if p.mode == "gated_prefix_loop"})
+    return selected
 
 
 def summarize(rows):
@@ -58,7 +101,15 @@ def summarize(rows):
     verifies = sum(r["verify_calls"] for r in rows)
     accepted = sum(sum(r["acceptance_lengths"]) for r in rows)
     retained = [n for r in rows for n in r["retained_lengths"]]
+    passes = [n for r in rows for n in r.get("draft_pass_counts", [])]
+    gate_checks = sum(r.get("prefix_decision_counts", {}).get("gate_checks", 0) for r in rows)
+    gate_passes = sum(r.get("prefix_decision_counts", {}).get("gate_passes", 0) for r in rows)
     return dict(decode_tokens=tokens, decode_seconds=seconds,
+                second_pass_rate=sum(n > 1 for n in passes) / verifies if verifies and passes else None,
+                gate_checks=gate_checks, gate_passes=gate_passes,
+                gate_pass_rate=gate_passes / gate_checks if gate_checks else None,
+                shift_clipped=sum(r.get("prefix_decision_counts", {}).get("shift_clipped", 0) for r in rows),
+                mean_applied_cut=sum(r.get("prefix_decision_counts", {}).get("applied_cut_sum", 0) for r in rows) / gate_passes if gate_passes else None,
                 tok_s=tokens / seconds if seconds else 0,
                 ms_token=1000 * seconds / tokens if tokens else None,
                 verify_calls=verifies, verifies_per_100_tokens=100 * verifies / tokens if tokens else None,
@@ -119,14 +170,7 @@ def main():
     (outdir / "prompt_hashes.json").write_text(json.dumps(prompt_hashes, indent=2))
     common = dict(max_draft_passes=args.max_draft_passes, min_continue_tokens=args.min_continue_tokens,
                   max_candidates=args.max_candidates, total_logp_budget=args.total_logp_budget)
-    configs = {"single": PrefixPolicy(mode="single", **common)}
-    for gate in (-0.5, -1.0, -2.0):
-        configs[f"original_g{gate}"] = PrefixPolicy(mode="original_loop", loop_gate=gate, **common)
-    for rule, thresholds in (("prefix_logp", (-0.5, -1.0, -2.0)), ("token_prob", (0.8, 0.9, 0.95))):
-        for threshold in thresholds:
-            for mode in ("truncate_verify", "adaptive_loop"):
-                configs[f"{mode}_{rule}_{threshold}"] = PrefixPolicy(
-                    mode=mode, rule=rule, threshold=threshold, **common)
+    configs = experiment_configs(args)
     (outdir / "configs.json").write_text(json.dumps({k: asdict(v) for k, v in configs.items()}, indent=2))
 
     def generate(idx, policy, length=None, trace=False):
@@ -156,7 +200,8 @@ def main():
                        time_to_first_token=r.time_to_first_token, verify_calls=r.verify_calls,
                        draft_calls=r.draft_calls, acceptance_lengths=r.acceptance_lengths,
                        committed_lengths=r.committed_lengths, verify_lengths=r.verify_lengths,
-                       retained_lengths=r.retained_lengths)
+                       retained_lengths=r.retained_lengths, draft_pass_counts=r.draft_pass_counts,
+                       prefix_decision_counts=r.prefix_decision_counts)
             if trace:
                 row["round_traces"] = r.round_traces
             with (outdir / ("traces.jsonl" if trace else "responses.jsonl")).open("a") as f:
@@ -165,7 +210,9 @@ def main():
                 from eval.ar_diagnostics import diagnose_mismatch, mismatch_summary
                 detail = mismatch_summary(reference[idx], ids_out, tokenizer)
                 print(f"AR mismatch: {phase}/{name}/sample {idx}: {detail}", flush=True)
-                if name not in diagnostic_done:
+                should_diagnose = args.mismatch_diagnostics != "off" and (
+                    not diagnostic_done if args.mismatch_diagnostics == "first" else name not in diagnostic_done)
+                if should_diagnose:
                     diagnostic_done.add(name)
                     diagnostic_path = outdir / f"mismatch_{phase}_{name}_{idx}.json"
                     try:
@@ -178,7 +225,10 @@ def main():
                 if args.ar_check == "strict":
                     raise RuntimeError(f"AR mismatch: {phase}/{name}/sample {idx}; see mismatch_*.json in {outdir}")
             rows.append(row)
-        summary = dict(phase=phase, config=name, repeat=repeat, **summarize(rows))
+        summary = dict(phase=phase, config=name, repeat=repeat,
+                       cut_offset=policy.cut_offset if policy and policy.mode == "gated_prefix_loop" else None,
+                       min_confident_ratio=policy.min_confident_ratio if policy and policy.mode == "gated_prefix_loop" else None,
+                       **summarize(rows))
         with (outdir / ("trace_summaries.jsonl" if trace else "summaries.jsonl")).open("a") as f:
             f.write(json.dumps(summary) + "\n")
         print(f"{phase:8s} {name:45s} {summary['tok_s']:8.2f} tok/s  AR {summary['ar_match']}/{len(rows)}", flush=True)
@@ -192,10 +242,7 @@ def main():
     names = list(configs)
     random.Random(args.seed).shuffle(names)
     scores = {name: run(name, configs[name], tune, "tune") for name in names}
-    selected = {"single": "single"}
-    for mode in ("original_loop", "truncate_verify", "adaptive_loop"):
-        candidates = [n for n, p in configs.items() if p.mode == mode]
-        selected[mode] = max(candidates, key=lambda n: scores[n]["tok_s"])
+    selected = select_confirmation_configs(configs, scores, args.experiment)
     (outdir / "selected.json").write_text(json.dumps(selected, indent=2))
     for rep in range(args.repeats):
         # Establish AR outputs before shuffled measured strategy runs.

@@ -4,6 +4,60 @@ This is an inference-only prototype. It uses the released
 `naver-ai/DLoop-DFlash-Qwen3-4B` drafter with `Qwen/Qwen3-4B`.
 No Qwen3-4B GPU speedup has been measured by the implementation author.
 
+## Gated boundary-offset sweep (new experiment)
+
+`--experiment prefix_offsets` evaluates all seven requested offsets against the
+same held-out prompts. It keeps `single` as a control, tunes the original DLoop
+gate on the tuning split, and confirms that baseline plus EVERY offset. Offsets
+are not collapsed to a single tuning winner.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/run_adaptive_qwen3_4b_smoke.py \
+  --model /home/jovyan/LMM/lmm_model/Qwen3-4B \
+  --draft-model /home/jovyan/LMM/lmm_model/Loop-DFlash-Qwen3-4B \
+  --data-file "$HOME/LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/DeepSpec-main/eval_datasets/gsm8k.jsonl" \
+  --experiment prefix_offsets \
+  --min-confident-ratio 0.8 --prefix-threshold -2 \
+  --cut-offsets -3 -2 -1 0 1 2 4 \
+  --max-draft-passes 2 \
+  --smoke-samples 1 --tune-samples 4 --eval-samples 16 \
+  --max-new-tokens 256 --repeats 1 \
+  --ar-check warn --mismatch-diagnostics off
+```
+
+For a larger confirmation use `--eval-samples 64 --repeats 3`. You can add
+`--trace-samples 2` for separate diagnostic reruns.
+
+The rule is:
+
+1. Find the longest prefix k whose cumulative draft log probability >= -2.
+2. Gate continuation using **unshifted** k: k >= ceil(0.8 * 15) = 12.
+3. If the gate fails, verify the full original proposal without another draft.
+4. If the gate passes, retain clamp(k + offset, 1, 15), use its last token as
+   the next anchor, and restart drafting at the following position.
+5. The final pass retains its full available proposal for verification. Offsets
+   change continuation boundaries, not final verification lengths.
+
+For k=12, offsets -3,-2,-1,0,+1,+2,+4 retain 9,10,11,12,13,14,15 tokens.
+The +4 request clips to 15 (actual shift +3). Positive offsets deliberately allow
+some tokens beyond the confidence boundary; negative offsets back off from it.
+The ratio is not rechecked after shifting. At candidate width 15, ratios .75 and
+.8 both require 12 tokens after rounding up, so those two ratios are identical.
+When k=15 and offset=0, continuation and the final full block reproduce the
+original whole-block DLoop behavior (with the same confidence threshold/limits).
+Negative offsets also apply when k=15; positive offsets then clip at 15.
+Near the output/candidate limit, a full available proposal is verified directly
+instead of lowering the ratio denominator to force an extra short draft.
+
+`comparison.csv` includes `cut_offset`, `min_confident_ratio`, `second_pass_rate`,
+`gate_pass_rate`, `mean_applied_cut`, and `shift_clipped`. `responses.jsonl`
+records per-request draft-pass counts and gate/clip counters. Detailed traces
+record the raw confidence boundary separately from the applied cut.
+
+The older `--experiment legacy` remains available and is the default. It uses
+the previous truncation rules, including its final-pass truncation, so it should
+not be confused with the new gated experiment.
+
 ## Setup
 
 Use the upstream CUDA environment (tested upstream with torch 2.8/2.9).
