@@ -1,0 +1,54 @@
+"""Summarize held-out runs; tuning results are never presented as confirmation."""
+
+import argparse
+import csv
+import json
+import statistics
+from collections import defaultdict
+from pathlib import Path
+
+
+def summarize_directory(directory):
+    groups = defaultdict(list)
+    for line in (directory / "summaries.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        if row["phase"] == "confirm":
+            groups[row["config"]].append(row)
+    result = []
+    baseline = next((statistics.median(r["tok_s"] for r in rows)
+                     for name, rows in groups.items() if name.startswith("original_")), None)
+    ar = statistics.median(r["tok_s"] for r in groups.get("target_ar", [])) if groups.get("target_ar") else None
+    for name, rows in groups.items():
+        speed = statistics.median(r["tok_s"] for r in rows)
+        def mean(key):
+            values = [r[key] for r in rows if r[key] is not None]
+            return statistics.mean(values) if values else None
+        result.append(dict(config=name, repeats=len(rows), median_tok_s=speed,
+                           min_tok_s=min(r["tok_s"] for r in rows), max_tok_s=max(r["tok_s"] for r in rows),
+                           speedup_vs_ar=speed / ar if ar else None,
+                           gain_vs_original_pct=100 * (speed / baseline - 1) if baseline else None,
+                           verifies_per_100_tokens=mean("verifies_per_100_tokens"),
+                           mean_accepted_draft=mean("mean_accepted_draft"), mean_committed=mean("mean_committed"),
+                           ar_match=sum(r["ar_match"] for r in rows), samples=sum(r["samples"] for r in rows)))
+    return result
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("directory", type=Path)
+    args = p.parse_args()
+    result = summarize_directory(args.directory)
+    if not result:
+        raise SystemExit("No held-out confirmation results yet.")
+    with (args.directory / "comparison.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(result[0]))
+        writer.writeheader()
+        writer.writerows(result)
+    for row in result:
+        gain = row["gain_vs_original_pct"]
+        gain_text = f"{gain:+.2f}%" if gain is not None else "n/a"
+        print(f"{row['config']:45s} {row['median_tok_s']:8.2f} tok/s  vs DLoop {gain_text}")
+
+
+if __name__ == "__main__":
+    main()

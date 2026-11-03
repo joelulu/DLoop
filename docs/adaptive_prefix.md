@@ -1,0 +1,152 @@
+# Qwen3-4B adaptive-prefix inference experiment
+
+This is an inference-only prototype. It uses the released
+`naver-ai/DLoop-DFlash-Qwen3-4B` drafter with `Qwen/Qwen3-4B`.
+No Qwen3-4B GPU speedup has been measured by the implementation author.
+
+## Setup
+
+Use the upstream CUDA environment (tested upstream with torch 2.8/2.9).
+Keep the upstream-tested Transformers version for the existing model classes:
+
+```bash
+git fetch origin
+git switch research/adaptive-prefix-loop
+python -m pip install -e . 'transformers==5.8.1'
+python -m unittest discover -s tests -v
+```
+
+The tests run on CPU and require no checkpoint downloads. They include a tiny
+randomly initialized real Qwen3 target + real DFlash backbone, as well as
+scripted tests forcing 10+8 retention and checking carrier/position alignment.
+They are correctness checks, not evidence of Qwen3-4B model quality or speed.
+
+## Fast GPU screening
+
+Run from the repository root. A single GPU holds target and draft; GPU index is
+relative to CUDA_VISIBLE_DEVICES. Models are loaded only once.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/run_adaptive_qwen3_4b_smoke.py \
+  --device cuda:0 \
+  --smoke-samples 1 --tune-samples 4 --eval-samples 16 \
+  --max-new-tokens 256 --repeats 1
+```
+
+Larger confirmation (3 smoke + 16 tuning + 64 separate held-out samples,
+3 repeats; GSM8K by default):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/run_adaptive_qwen3_4b_smoke.py \
+  --device cuda:0 --trace-samples 2
+```
+
+Use local checkpoint directories if already downloaded:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/run_adaptive_qwen3_4b_smoke.py \
+  --model "$HOME/LMM/lmm_model/Qwen3-4B" \
+  --draft-model "$HOME/LMM/lmm_model/DLoop-DFlash-Qwen3-4B" \
+  --smoke-samples 1 --tune-samples 4 --eval-samples 16 --repeats 1
+```
+
+`--dataset math500` and `--dataset mbpp` reuse the upstream prompts. For offline
+data use `--data-file /path/data.jsonl`, with either `{"prompt": "..."}` or
+`{"turns": ["..."]}` per line. This script evaluates the first turn only.
+At least smoke+tune+eval distinct rows are required. Prompts use upstream
+`enable_thinking=False`. Default seed is 42.
+
+## Methods and controls
+
+All four modes use the **same checkpoint**, common causal verifier, EOS handling,
+and output cap. Every draft forward keeps the checkpoint's original width:
+block_size=16 means 1 anchor plus 15 speculative tokens. Candidate count limits
+exclude the anchor. `max_draft_passes=2` is the TOTAL number of draft forwards,
+equivalent to upstream `stage_cap=1` extra stage.
+
+| Mode | Action |
+| --- | --- |
+| single | One full draft, then verify |
+| original_loop | Whole-block confidence gate, append full blocks, then verify |
+| truncate_verify | Keep a confidence-selected prefix, immediately verify |
+| adaptive_loop | Keep a confidence-selected prefix, restart at that boundary, repeat, then verify |
+
+`original_loop` reproduces upstream gate and carrier layout, but uses the common
+verifier/timer. The original `legacy` code path is unchanged. Candidate/output
+caps may shorten the final round in the common path; upstream does not apply the
+same final-round cap before verification.
+
+Two prefix rules are swept:
+
+- prefix_logp: longest prefix with cumulative draft log probability >= threshold
+  (-0.5, -1, -2).
+- token_prob: prefix ending before the first token below threshold
+  (0.8, 0.9, 0.95). No skipping uncertain positions.
+
+Original DLoop gates are swept over -0.5, -1, -2 as well. Best settings for each
+method are selected on the tuning split ONLY. All selected methods are then
+evaluated on the same held-out split in shuffled method order. Target-only AR is
+run for each sample, and a token mismatch aborts the run after saving the row.
+Do not interpret very small screening splits as a reliable final speedup claim.
+
+First-pass zero retention falls back to verifying the full original proposal.
+Later-pass zero retention adds nothing and verifies the accumulated proposals.
+`--min-continue-tokens` stops continuation after a short retained segment.
+`--max-candidates` limits the accumulated proposal count (default 30).
+Optional `--total-logp-budget -2` limits cumulative retained log probability;
+the zero-prefix fallback still takes priority so generation always progresses.
+
+Retained token prefixes and hidden carriers are sliced together. The retained
+last token is the next stage's unverified anchor; its carrier is omitted exactly
+as in upstream DLoop. Draft cache temporaries are discarded back to the verified
+context boundary. No target forward occurs between draft passes. Because draft
+attention is bidirectional, slicing saved hidden states does NOT recompute them
+as if the discarded mask slots had never existed.
+
+## Output and timing
+
+Each run creates a new `results/adaptive_qwen3_4b_TIMESTAMP/` directory:
+
+- `manifest.json`: arguments, versions, GPU, commit SHA, disjoint sample IDs.
+- `configs.json`, `selected.json`, `prompt_hashes.json`: reproducibility metadata.
+- `responses.jsonl`: per-sample outputs, timings, actual draft/verify counts.
+- `summaries.jsonl`: smoke, tuning and held-out summaries (explicit phase labels).
+- `comparison.csv`: held-out median throughput, repeat range, gain over original
+  DLoop, speedup over AR, verification frequency, accepted drafts, AR matches.
+- `traces.jsonl`: optional separate diagnostic reruns with retained segment
+  lengths, effective acceptance, second-segment acceptance and stopping reason.
+
+Decode timing excludes target prefill and the first generated token, and includes
+the first draft context-prefill cost. Throughput is total **actual decode tokens
+divided by total elapsed decode seconds**, not an average of request rates.
+Accepted draft tokens exclude the bonus; committed tokens include it. EOS/output
+caps are applied before metrics. Verification widths include the anchor.
+Every mode includes normal Python control/selection overhead. Detailed traces
+are disabled in timing runs; diagnostic reruns never enter comparison.csv.
+
+The main question is whether reduced target calls outweigh extra draft work.
+Longer retained blocks or acceptance alone do not establish a speedup.
+
+Rebuild a summary with:
+
+```bash
+python scripts/summarize_adaptive_results.py results/your_run_directory
+```
+
+## Existing benchmark entry point
+
+The original default remains `--decode-mode legacy`. For the new modes:
+
+```bash
+python -m eval.benchmark --model Qwen/Qwen3-4B --dataset gsm8k \
+  --max-samples 16 --max-new-tokens 256 --baseline --decode-mode single
+python -m eval.benchmark --model Qwen/Qwen3-4B \
+  --draft-model naver-ai/DLoop-DFlash-Qwen3-4B --dataset gsm8k \
+  --max-samples 16 --max-new-tokens 256 --decode-mode adaptive_loop \
+  --prefix-rule prefix_logp --prefix-threshold -1 --max-draft-passes 2
+```
+
+New modes use a separate baseline-cache namespace so upstream timing conventions
+are not silently mixed. The standalone screening script above is the preferred
+path for threshold selection and matched, repeated comparisons. Random sampling,
+tree verification, DSpark, Domino and batched serving are outside this prototype.

@@ -1,4 +1,6 @@
 ## DLoop: Looped Speculative Decoding
+
+Fork experiment: [Qwen3-4B adaptive-prefix inference and quick GPU screening](docs/adaptive_prefix.md).
 [![arXiv](https://img.shields.io/badge/arXiv%20paper-2610.07659-b31b1b.svg)](https://arxiv.org/abs/2610.07659)
 
 Welcome to the official PyTorch implementation of DLoop!

@@ -297,6 +297,17 @@ def _make_generate(args, host: str, draft, target, stop_ids):
         from .tree_decode import dflash_tree_generate
 
         def generate(input_ids, max_new_tokens, gate):
+            if args.decode_mode != "legacy":
+                from .adaptive_linear_decode import PrefixPolicy, adaptive_dflash_generate
+                return adaptive_dflash_generate(
+                    draft, target, input_ids, max_new_tokens, stop_ids,
+                    policy=PrefixPolicy(mode=args.decode_mode, rule=args.prefix_rule,
+                                        threshold=args.prefix_threshold, loop_gate=gate,
+                                        max_draft_passes=args.max_draft_passes,
+                                        min_continue_tokens=args.min_continue_tokens,
+                                        max_candidates=args.max_candidates,
+                                        total_logp_budget=args.total_logp_budget),
+                    trace=args.trace_rounds)
             if not args.tree_budget:
                 return dflash_generate(draft, target, input_ids, max_new_tokens, stop_ids,
                                        loop_gate=gate, stage_cap=args.stage_cap, return_stats=True)
@@ -345,6 +356,8 @@ def _make_generate(args, host: str, draft, target, stop_ids):
 def _baseline_path(args, gpu_name: str) -> Path:
     key = (f"{_sanitize(args.model)}_{args.dataset}_maxnew{args.max_new_tokens}"
            f"_samples{args.max_samples}_{_sanitize(gpu_name)}")
+    if args.decode_mode != "legacy":
+        key += "_consistent_decode_v1"
     return BASELINE_CACHE_DIR / f"{key}.json"
 
 
@@ -372,6 +385,11 @@ def _results_path(args, host: str, gpu_name: str) -> Path:
     else:
         key += f"_k{args.mtp_k}"
         key += f"_loop{args.stage_len}g{args.loop_gate}_cap{args.stage_cap}" if loop else ""
+    if args.decode_mode != "legacy":
+        key += (f"_{args.decode_mode}_{args.prefix_rule}{args.prefix_threshold}"
+                f"_passes{args.max_draft_passes}_min{args.min_continue_tokens}"
+                f"_maxcand{args.max_candidates}_risk{args.total_logp_budget}"
+                f"_trace{int(args.trace_rounds)}")
     draft = Path(args.draft_model)
     return RESULTS_DIR / _sanitize(draft.parent.name or "hub") / f"{_sanitize(draft.name)}__{key}.json"
 
@@ -412,6 +430,11 @@ def run_baseline(args) -> None:
     filler = next(i for i in range(8) if i not in stop_ids)
     dataset = _limit_dataset(load_and_process_dataset(args.dataset), args.max_samples)
 
+    if args.decode_mode != "legacy" and _dist_rank() < len(dataset):
+        from .adaptive_linear_decode import adaptive_dflash_generate
+        warm_ids = _encode_turn(tokenizer, [{"role": "user", "content": dataset[_dist_rank()]["turns"][0]}], device)
+        adaptive_dflash_generate(None, target, warm_ids, min(64, args.max_new_tokens), stop_ids)
+
     tpots = []
     for idx in tqdm(range(_dist_rank(), len(dataset), _dist_size()), disable=_dist_rank() != 0):
         messages = []
@@ -420,6 +443,9 @@ def run_baseline(args) -> None:
             input_ids = _encode_turn(tokenizer, messages, device)
             if mtp:  # hybrid (linear-attention) caches are never cropped
                 r = mtp_target_ar_generate(target, input_ids, args.max_new_tokens, stop_ids, return_stats=True)
+            elif args.decode_mode != "legacy":
+                from .adaptive_linear_decode import adaptive_dflash_generate
+                r = adaptive_dflash_generate(None, target, input_ids, args.max_new_tokens, stop_ids)
             else:
                 r = dflash_generate(None, target, input_ids, args.max_new_tokens, stop_ids,
                                     block_size=1, mask_token_id=filler, return_stats=True)
@@ -452,6 +478,8 @@ def run_draft(args) -> None:
 
     target, draft = _load_models(args, host, device)
     _fill_host_defaults(args, host, target)
+    if args.decode_mode != "legacy" and (host != "dflash" or args.tree_budget):
+        raise ValueError("prefix decode modes currently support linear DFlash only")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     stop_ids = _stop_ids(tokenizer, target, host == "mtp")
     generate = _make_generate(args, host, draft, target, stop_ids)
@@ -481,6 +509,10 @@ def run_draft(args) -> None:
         "num_output_tokens": r.num_output_tokens,
         "acceptance_lengths": list(r.acceptance_lengths),
         "stages_fired": list(getattr(r, "stages_fired", [])),
+        **({k: getattr(r, k) for k in (
+            "decode_tokens", "decode_seconds", "verify_calls", "draft_calls",
+            "committed_lengths", "verify_lengths", "retained_lengths", "round_traces"
+        )} if args.decode_mode != "legacy" else {}),
         "output_ids": r.output_ids[0, r.num_input_tokens:].tolist(),
     } for r in responses]
     gathered = _dist_gather(torch_dist, stats)
@@ -488,7 +520,7 @@ def run_draft(args) -> None:
         return
     stats = list(chain(*gathered))
 
-    n_stages = args.stage_cap if args.loop_gate <= 0 else 0
+    n_stages = args.stage_cap if args.loop_gate <= 0 and args.decode_mode == "legacy" else 0
     accepted = list(chain.from_iterable(s["acceptance_lengths"] for s in stats))
     tpot = float(np.mean([s["time_per_output_token"] for s in stats]))
     rounds = len(accepted)
@@ -550,6 +582,15 @@ def main() -> None:
     t.add_argument("--tree-depth", type=int, default=None, help="EAGLE-3 tree depth (default 7)")
     t.add_argument("--tree-width", type=int, default=12, help="DARTree width W")
     t.add_argument("--tree-beta", type=float, default=-0.2, help="DARTree length bonus beta")
+    a = p.add_argument_group("adaptive prefix experiments (DFlash, greedy, batch one)")
+    a.add_argument("--decode-mode", choices=["legacy", "single", "original_loop", "truncate_verify", "adaptive_loop"], default="legacy")
+    a.add_argument("--prefix-rule", choices=["prefix_logp", "token_prob"], default="prefix_logp")
+    a.add_argument("--prefix-threshold", type=float, default=-1.0)
+    a.add_argument("--max-draft-passes", type=int, default=2, help="TOTAL draft forwards per verification")
+    a.add_argument("--min-continue-tokens", type=int, default=1)
+    a.add_argument("--max-candidates", type=int, default=30)
+    a.add_argument("--total-logp-budget", type=float, default=None)
+    a.add_argument("--trace-rounds", action="store_true", help="diagnostics only; disables comparable timing")
     p.add_argument("--mtp-k", type=int, default=None,
                    help="MTP draft steps per round (default: Qwen3.5 3, Gemma 4 6)")
     args = p.parse_args()
