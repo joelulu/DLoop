@@ -6,7 +6,7 @@ from unittest.mock import patch
 import torch
 
 from eval.adaptive_linear_decode import PrefixPolicy, gated_prefix_decision, adaptive_dflash_generate
-from scripts.run_adaptive_qwen3_4b_smoke import experiment_configs, select_confirmation_configs, parse_args
+from scripts.run_adaptive_qwen3_4b_smoke import experiment_configs, select_confirmation_configs, parse_args, full_width_parity
 from test_adaptive_decode import Draft, Target
 
 
@@ -96,6 +96,62 @@ class OffsetTests(unittest.TestCase):
             args = parse_args()
         self.assertEqual(args.cut_offsets, [-3, -2, -1, 0, 1, 2, 4])
         self.assertEqual(args.mismatch_diagnostics, "off")
+
+    def test_integer_gates_cut_at_actual_prefix(self):
+        for minimum in (15, 13, 12):
+            for confident in (11, 12, 13, 14, 15):
+                with self.subTest(minimum=minimum, confident=confident):
+                    lp = torch.tensor([-.001] * confident + [-3.] * (15 - confident))
+                    policy = PrefixPolicy(mode="gated_prefix_loop", threshold=-2.,
+                                          min_confident_tokens=minimum, cut_offset=0)
+                    keep, go, raw, _ = gated_prefix_decision(lp, policy, 30, 0)
+                    self.assertEqual(raw, confident)
+                    self.assertEqual(go, confident >= minimum)
+                    self.assertEqual(keep, confident if go else 15)
+
+    def test_integer_full_width_matches_original_with_passing_and_failing_gates(self):
+        prompt = torch.tensor([[1, 2, 3]])
+        for confident in ((12, 15), (13, 15), (15, 15)):
+            with self.subTest(confident=confident):
+                a = adaptive_dflash_generate(Draft(confident=confident), Target(), prompt, 100, [],
+                    PrefixPolicy(mode="gated_prefix_loop", threshold=-2., min_confident_tokens=15))
+                b = adaptive_dflash_generate(Draft(confident=confident), Target(), prompt, 100, [],
+                    PrefixPolicy(mode="original_loop", loop_gate=-2.))
+                self.assertTrue(torch.equal(a.output_ids, b.output_ids))
+                for field in ("retained_lengths", "verify_lengths", "draft_pass_counts",
+                              "draft_calls", "verify_calls", "acceptance_lengths"):
+                    self.assertEqual(getattr(a, field), getattr(b, field), field)
+
+    def test_integer_gate_validation(self):
+        for minimum in (0, -1, 12.5):
+            with self.subTest(minimum=minimum), self.assertRaises(ValueError):
+                PrefixPolicy(min_confident_tokens=minimum)
+        with self.assertRaises(ValueError):
+            gated_prefix_decision(torch.zeros(15), self.policy(min_confident_tokens=16), 30, 0)
+
+    def test_all_integer_gates_reach_confirmation_with_same_baseline(self):
+        with patch("sys.argv", ["runner", "--experiment", "prefix_lengths"]):
+            args = parse_args()
+        configs = experiment_configs(args)
+        self.assertEqual(len(configs), 5)
+        original = [p for p in configs.values() if p.mode == "original_loop"]
+        self.assertEqual([p.loop_gate for p in original], [-2.])
+        selected = select_confirmation_configs(configs, {n: {"tok_s": i} for i, n in enumerate(configs)},
+                                               "prefix_lengths")
+        gated = [configs[n] for n in selected.values() if configs[n].mode == "gated_prefix_loop"]
+        self.assertEqual([p.min_confident_tokens for p in gated], [15, 13, 12])
+        self.assertTrue(all(p.cut_offset == 0 and p.threshold == -2. for p in gated))
+
+    def test_parity_reporting_ignores_timing_but_detects_schedule_changes(self):
+        original = dict(phase="confirm", repeat=0, sample_id=1, config="original_g-2.0",
+                        policy=dict(mode="original_loop", loop_gate=-2.), decode_seconds=1.,
+                        output_ids=[1, 2], draft_calls=2, verify_calls=1, verify_lengths=[31],
+                        retained_lengths=[15, 15], draft_pass_counts=[2], acceptance_lengths=[2])
+        gated = dict(original, config="gated_n15", decode_seconds=2.,
+                     policy=dict(mode="gated_prefix_loop", min_confident_tokens=15, threshold=-2.))
+        self.assertTrue(full_width_parity([gated, original], 15)[0]["matches"])
+        gated["verify_lengths"] = [16]
+        self.assertEqual(full_width_parity([gated, original], 15)[0]["differing_fields"], ["verify_lengths"])
 
 
 if __name__ == "__main__":

@@ -189,6 +189,34 @@ python scripts/summarize_adaptive_results.py results/your_run_directory
 
 ## Existing benchmark entry point
 
+### Integer prefix gates: 15 vs 13 vs 12
+
+Use `--experiment prefix_lengths --confident-prefix-lengths 15 13 12` to compare
+three minimum confident-prefix lengths. All offsets are forced to zero. The
+original-loop baseline uses the same `--prefix-threshold` (default -2), rather
+than tuning a different gate. Single-pass decoding is also included as a control.
+Every integer-gate configuration reaches held-out confirmation.
+
+If the longest confident prefix is `k`, continue only when `k >= minimum`, and
+retain exactly `k` tokens before the second draft. Otherwise verify the entire
+first proposal. The second draft always retains its full proposal. With block
+size 16 there are 15 drafted candidates (one position is the anchor); minimum 15
+and offset zero therefore reproduce the original full-block gate, given the
+same threshold, candidate cap, and pass limit. They need not have identical timing.
+`full_width_parity.jsonl` checks their outputs and draft/verify schedules on the
+same samples, independently of the target-AR comparison.
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python scripts/run_adaptive_qwen3_4b_smoke.py \
+  --model /home/jovyan/LMM/lmm_model/Qwen3-4B \
+  --draft-model /home/jovyan/LMM/lmm_model/Loop-DFlash-Qwen3-4B \
+  --data-file "$HOME/LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/DeepSpec-main/eval_datasets/gsm8k.jsonl" \
+  --device cuda:0 --experiment prefix_lengths --confident-prefix-lengths 15 13 12 \
+  --prefix-threshold -2 --max-draft-passes 2 \
+  --smoke-samples 1 --tune-samples 4 --eval-samples 16 \
+  --max-new-tokens 256 --repeats 1 --ar-check warn --mismatch-diagnostics off
+```
+
 The original default remains `--decode-mode legacy`. For the new modes:
 
 ```bash

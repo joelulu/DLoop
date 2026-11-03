@@ -309,7 +309,8 @@ def _make_generate(args, host: str, draft, target, stop_ids):
                                         min_continue_tokens=args.min_continue_tokens,
                                         max_candidates=args.max_candidates,
                                         total_logp_budget=args.total_logp_budget,
-                                        min_confident_ratio=args.min_confident_ratio, cut_offset=args.cut_offset),
+                                        min_confident_ratio=args.min_confident_ratio,
+                                        min_confident_tokens=args.min_confident_tokens, cut_offset=args.cut_offset),
                     trace=args.trace_rounds)
             if not args.tree_budget:
                 return dflash_generate(draft, target, input_ids, max_new_tokens, stop_ids,
@@ -392,7 +393,7 @@ def _results_path(args, host: str, gpu_name: str) -> Path:
         key += (f"_{args.decode_mode}_{args.prefix_rule}{args.prefix_threshold}"
                 f"_passes{args.max_draft_passes}_min{args.min_continue_tokens}"
                 f"_maxcand{args.max_candidates}_risk{args.total_logp_budget}"
-                f"_ratio{args.min_confident_ratio}_offset{args.cut_offset}_trace{int(args.trace_rounds)}")
+                f"_ratio{args.min_confident_ratio}_mintok{args.min_confident_tokens}_offset{args.cut_offset}_trace{int(args.trace_rounds)}")
     draft = Path(args.draft_model)
     return RESULTS_DIR / _sanitize(draft.parent.name or "hub") / f"{_sanitize(draft.name)}__{key}.json"
 
@@ -587,6 +588,7 @@ def main() -> None:
     t.add_argument("--tree-beta", type=float, default=-0.2, help="DARTree length bonus beta")
     a = p.add_argument_group("adaptive prefix experiments (DFlash, greedy, batch one)")
     a.add_argument("--decode-mode", choices=["legacy", "single", "original_loop", "truncate_verify", "adaptive_loop", "gated_prefix_loop"], default="legacy")
+    a.add_argument("--min-confident-tokens", type=int, default=None)
     a.add_argument("--min-confident-ratio", type=float, default=0.8)
     a.add_argument("--cut-offset", type=int, default=0)
     a.add_argument("--prefix-rule", choices=["prefix_logp", "token_prob"], default="prefix_logp")

@@ -25,6 +25,7 @@ class PrefixPolicy:
     max_candidates: int = 30
     total_logp_budget: float | None = None
     min_confident_ratio: float = 0.8
+    min_confident_tokens: int | None = None
     cut_offset: int = 0
 
     def __post_init__(self):
@@ -44,6 +45,10 @@ class PrefixPolicy:
             raise ValueError("min_confident_ratio must be in (0, 1]")
         if not isinstance(self.cut_offset, int):
             raise ValueError("cut_offset must be an integer")
+        if self.min_confident_tokens is not None and (
+            not isinstance(self.min_confident_tokens, int) or self.min_confident_tokens < 1
+        ):
+            raise ValueError("min_confident_tokens must be a positive integer")
         if self.mode == "gated_prefix_loop" and self.total_logp_budget is not None:
             raise ValueError("gated_prefix_loop does not use the legacy total_logp_budget")
         if self.total_logp_budget is not None and (
@@ -71,13 +76,20 @@ def gated_prefix_decision(token_logp, policy, room, pass_index):
     Returns (retained length, continue, raw confident length, reason).
     """
     width = token_logp.numel()
+    minimum = policy.min_confident_tokens if policy.min_confident_tokens is not None else math.ceil(
+        policy.min_confident_ratio * width)
+    if minimum > width:
+        raise ValueError(f"confident prefix minimum {minimum} exceeds candidate width {width}")
     full = min(width, room)
     if pass_index + 1 >= policy.max_draft_passes:
         return full, False, None, "final_full_block"
     if room <= width:
         return full, False, None, "tail_full_block"
     raw = select_prefix(token_logp, policy.rule, policy.threshold)
-    minimum = math.ceil(policy.min_confident_ratio * width)
+    if minimum == width and policy.rule == "prefix_logp":
+        # Match original_loop's reduction exactly at the full-width gate,
+        # including floating-point borderline cases (sum vs cumsum endpoint).
+        raw = width if float(token_logp.sum()) >= policy.threshold else min(raw, width - 1)
     if raw < minimum:
         return full, False, raw, "ratio_gate_failed_full_verify"
     cut = min(width, max(1, raw + policy.cut_offset))
@@ -127,6 +139,8 @@ def adaptive_dflash_generate(model, target, input_ids, max_new_tokens, stop_toke
     block = model.block_size if model is not None else 1
     if model is not None and block < 2:
         raise ValueError("DFlash checkpoint must have block_size >= 2")
+    if model is not None and policy.min_confident_tokens is not None and policy.min_confident_tokens > block - 1:
+        raise ValueError("min_confident_tokens exceeds the checkpoint's candidate count")
     stop_ids = set(stop_token_ids or [])
     target_cache, draft_cache = DynamicCache(), DynamicCache()
     positions = torch.arange(prompt_len + max_new_tokens + block, device=device)[None]

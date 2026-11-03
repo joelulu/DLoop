@@ -25,7 +25,8 @@ def parse_args():
     p.add_argument("--model", default="Qwen/Qwen3-4B")
     p.add_argument("--draft-model", default="naver-ai/DLoop-DFlash-Qwen3-4B")
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--experiment", choices=["legacy", "prefix_offsets"], default="legacy")
+    p.add_argument("--experiment", choices=["legacy", "prefix_offsets", "prefix_lengths"], default="legacy")
+    p.add_argument("--confident-prefix-lengths", type=int, nargs="+", default=[15, 13, 12])
     p.add_argument("--cut-offsets", type=int, nargs="+", default=[-3, -2, -1, 0, 1, 2, 4])
     p.add_argument("--min-confident-ratio", type=float, default=0.8)
     p.add_argument("--prefix-threshold", type=float, default=-2.0)
@@ -55,8 +56,8 @@ def parse_args():
             p.error(f"--{name.replace('_', '-')} must be positive")
     if args.max_new_tokens < 2:
         p.error("--max-new-tokens must be >= 2 to measure decode throughput")
-    if args.experiment == "prefix_offsets" and args.total_logp_budget is not None:
-        p.error("prefix_offsets does not use --total-logp-budget")
+    if args.experiment in {"prefix_offsets", "prefix_lengths"} and args.total_logp_budget is not None:
+        p.error("gated prefix experiments do not use --total-logp-budget")
     return args
 
 
@@ -65,9 +66,14 @@ def experiment_configs(args):
     common = dict(max_draft_passes=args.max_draft_passes, min_continue_tokens=args.min_continue_tokens,
                   max_candidates=args.max_candidates, total_logp_budget=args.total_logp_budget)
     configs = {"single": PrefixPolicy(mode="single", **common)}
-    for gate in (-0.5, -1.0, -2.0):
+    for gate in ([args.prefix_threshold] if args.experiment == "prefix_lengths" else (-0.5, -1.0, -2.0)):
         configs[f"original_g{gate}"] = PrefixPolicy(mode="original_loop", loop_gate=gate, **common)
-    if args.experiment == "prefix_offsets":
+    if args.experiment == "prefix_lengths":
+        for minimum in dict.fromkeys(args.confident_prefix_lengths):
+            name = f"gated_n{minimum}_g{args.prefix_threshold}_offset+0"
+            configs[name] = PrefixPolicy(mode="gated_prefix_loop", threshold=args.prefix_threshold,
+                                         min_confident_tokens=minimum, cut_offset=0, **common)
+    elif args.experiment == "prefix_offsets":
         for offset in dict.fromkeys(args.cut_offsets):
             name = f"gated_r{args.min_confident_ratio}_g{args.prefix_threshold}_offset{offset:+d}"
             configs[name] = PrefixPolicy(mode="gated_prefix_loop", threshold=args.prefix_threshold,
@@ -84,15 +90,37 @@ def experiment_configs(args):
 
 def select_confirmation_configs(configs, scores, experiment):
     selected = {"single": "single"}
-    modes = ("original_loop",) if experiment == "prefix_offsets" else (
+    modes = ("original_loop",) if experiment in {"prefix_offsets", "prefix_lengths"} else (
         "original_loop", "truncate_verify", "adaptive_loop")
     for mode in modes:
         candidates = [n for n, p in configs.items() if p.mode == mode]
         selected[mode] = max(candidates, key=lambda n: scores[n]["tok_s"])
-    if experiment == "prefix_offsets":
-        # Report EVERY offset on the same held-out samples, not only a winner.
+    if experiment in {"prefix_offsets", "prefix_lengths"}:
+        # Report EVERY offset/length on the same held-out samples, not only a winner.
         selected.update({name: name for name, p in configs.items() if p.mode == "gated_prefix_loop"})
     return selected
+
+
+def full_width_parity(rows, width):
+    """Compare the full-width gate to original_loop, excluding all timings."""
+    originals = {(r["phase"], r["repeat"], r["sample_id"], r["policy"]["loop_gate"]): r
+                 for r in rows if r.get("policy", {}).get("mode") == "original_loop"}
+    fields = ("output_ids", "draft_calls", "verify_calls", "verify_lengths",
+              "retained_lengths", "draft_pass_counts", "acceptance_lengths")
+    checks = []
+    for row in rows:
+        p = row.get("policy", {})
+        if p.get("mode") != "gated_prefix_loop" or p.get("min_confident_tokens") != width:
+            continue
+        key = (row["phase"], row["repeat"], row["sample_id"], p["threshold"])
+        original = originals.get(key)
+        if original is None:
+            continue
+        differing = [field for field in fields if row[field] != original[field]]
+        checks.append(dict(phase=row["phase"], repeat=row["repeat"], sample_id=row["sample_id"],
+                           config=row["config"], original=original["config"],
+                           matches=not differing, differing_fields=differing))
+    return checks
 
 
 def summarize(rows):
@@ -186,6 +214,7 @@ def main():
 
     reference = {}
     diagnostic_done = set()
+    parity_rows = []
     def run(name, policy, ids, phase, repeat=0, trace=False):
         rows = []
         for idx in ids:
@@ -204,6 +233,8 @@ def main():
                        prefix_decision_counts=r.prefix_decision_counts)
             if trace:
                 row["round_traces"] = r.round_traces
+            if args.experiment == "prefix_lengths" and policy is not None:
+                parity_rows.append(row)
             with (outdir / ("traces.jsonl" if trace else "responses.jsonl")).open("a") as f:
                 f.write(json.dumps(row) + "\n")
             if not matches:
@@ -227,7 +258,8 @@ def main():
             rows.append(row)
         summary = dict(phase=phase, config=name, repeat=repeat,
                        cut_offset=policy.cut_offset if policy and policy.mode == "gated_prefix_loop" else None,
-                       min_confident_ratio=policy.min_confident_ratio if policy and policy.mode == "gated_prefix_loop" else None,
+                       min_confident_ratio=policy.min_confident_ratio if policy and policy.mode == "gated_prefix_loop" and policy.min_confident_tokens is None else None,
+                       min_confident_tokens=policy.min_confident_tokens if policy and policy.mode == "gated_prefix_loop" else None,
                        **summarize(rows))
         with (outdir / ("trace_summaries.jsonl" if trace else "summaries.jsonl")).open("a") as f:
             f.write(json.dumps(summary) + "\n")
@@ -254,6 +286,13 @@ def main():
     for mode, name in selected.items():
         if args.trace_samples:
             run(name, configs[name], confirm[:args.trace_samples], "diagnose", trace=True)
+    if args.experiment == "prefix_lengths":
+        checks = full_width_parity(parity_rows, draft.block_size - 1)
+        (outdir / "full_width_parity.jsonl").write_text(
+            "".join(json.dumps(check) + "\n" for check in checks))
+        if checks:
+            matched = sum(check["matches"] for check in checks)
+            print(f"Full-width vs original DLoop parity: {matched}/{len(checks)} matched", flush=True)
     subprocess.run([sys.executable, str(ROOT / "scripts/summarize_adaptive_results.py"), str(outdir)], check=True)
     print(f"Results: {outdir}")
 

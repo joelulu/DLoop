@@ -26,6 +26,7 @@ def summarize_directory(directory):
             return statistics.mean(values) if values else None
         result.append(dict(config=name, cut_offset=rows[0].get("cut_offset"),
                            min_confident_ratio=rows[0].get("min_confident_ratio"),
+                           min_confident_tokens=rows[0].get("min_confident_tokens"),
                            second_pass_rate=mean("second_pass_rate"), gate_pass_rate=mean("gate_pass_rate"),
                            mean_applied_cut=mean("mean_applied_cut"), shift_clipped=mean("shift_clipped"),
                            repeats=len(rows), median_tok_s=speed,
